@@ -2,7 +2,7 @@
 /*
 Plugin Name: ChatGPT Bot
 Description: A WordPress chatbot plugin using the ChatGPT API, with conversation storage and CSV export.
-Version: 1.0
+Version: 1.1
 Author: Gabriel Rips
 */
 
@@ -13,11 +13,12 @@ if (!defined('ABSPATH')) exit;
 function chatgpt_start_session() {
     if (!isset($_COOKIE['chatgpt_session_id'])) {
         $session_id = wp_generate_uuid4();
-        setcookie('chatgpt_session_id', $session_id, time() + 86400, COOKIEPATH, COOKIE_DOMAIN, is_ssl(), true, true);
+        setcookie('chatgpt_session_id', $session_id, time() + 86400, COOKIEPATH, COOKIE_DOMAIN, is_ssl(), true);
         $_COOKIE['chatgpt_session_id'] = $session_id;
     }
 }
 add_action('init', 'chatgpt_start_session');
+
 
 
 // Create a database table for storing conversations when the plugin is activated
@@ -97,55 +98,29 @@ function chatgpt_api_request() {
         wp_die();
     }
 
-    // Use a transient key based on the session ID
-    $transient_key = 'chatgpt_history_' . $session_id;
+    // IMPORTANT: Get existing conversation using prepare statement
+    $existing_conversation = $wpdb->get_row($wpdb->prepare(
+        "SELECT * FROM $table_name WHERE session_id = %s LIMIT 1",
+        $session_id
+    ));
 
-    // Get conversation history from transient
-    $chatgpt_history = get_transient($transient_key);
-
-    // Initialize if not set
-    if (!$chatgpt_history) {
-        // Get the current day, tomorrow's day, and yesterday's day
-        $days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-        $currentDate = new DateTime();
-        $currentDay = $days[$currentDate->format('w')];
-
-        $tomorrowDate = (clone $currentDate)->modify('+1 day');
-        $tomorrowDay = $days[$tomorrowDate->format('w')];
-
-        $yesterdayDate = (clone $currentDate)->modify('-1 day');
-        $yesterdayDay = $days[$yesterdayDate->format('w')];
-
-        $currentDateNum = $currentDate->format('j'); // Day of the month (e.g., "20")
-        $currentMonth = $currentDate->format('F'); // Month (e.g., "November")
-
-        // Initialize the conversation history with the system message
-        $chatgpt_history = array(
-            array(
-                'role' => 'system',
-                'content' => "Today is $currentDay, the $currentDateNum of $currentMonth. Yesterday was $yesterdayDay, and tomorrow will be $tomorrowDay. You are a chatbot that will be placed on the Third Wave BBQ website to answer any customer's questions. Answer the question like a good customer service agent might. Be friendly and personable when answering. Ensure you consider things like the day and future days when answering questions. Elaborate on answers when you feel more information would be helpful."
-            )
-        );
-    }
-
-    // Get the existing conversation from the database
-    $existing_entry = $wpdb->get_row($wpdb->prepare("SELECT * FROM $table_name WHERE session_id = %s", $session_id));
-
-    // Initialize conversation history from database if available
-    if ($existing_entry) {
-        $chatgpt_history = json_decode($existing_entry->conversation, true); 
+    // Initialize chat history
+    if ($existing_conversation && !empty($existing_conversation->conversation)) {
+        // Decode existing conversation
+        $chatgpt_history = json_decode($existing_conversation->conversation, true);
+        if (!is_array($chatgpt_history)) {
+            // If decoding fails, initialize new history
+            $chatgpt_history = initialize_chat_history();
+        }
+    } else {
+        $chatgpt_history = initialize_chat_history();
     }
 
     // Add the user's message to the conversation history
     $chatgpt_history[] = array('role' => 'user', 'content' => $message);
 
-    // Save the updated conversation history in a transient (expires in 24 hours)
-    set_transient($transient_key, $chatgpt_history, 24 * HOUR_IN_SECONDS);
-
-    // Securely get the API key
-    // Retrieve the API key from the settings
+    // Get the API key
     $api_key = get_option('chatgpt_api_key', '');
-
     if (empty($api_key)) {
         wp_send_json_error('API key is not configured. Please check the settings.', 500);
         wp_die();
@@ -159,7 +134,7 @@ function chatgpt_api_request() {
     $api_request_body = array(
         'model' => $model_name,
         'messages' => $chatgpt_history,
-        'temperature' => 0.3,
+        'temperature' => 0,
     );
 
     // Send the API request
@@ -181,80 +156,56 @@ function chatgpt_api_request() {
     $response_body = wp_remote_retrieve_body($response);
     $data = json_decode($response_body, true);
 
-    if (json_last_error() !== JSON_ERROR_NONE) {
-        error_log('Invalid JSON from API: ' . $response_body);
-        wp_send_json_error('An error occurred while processing your request.');
-        wp_die();
-    }
-
-    if (isset($data['error'])) {
-        $error_message = 'The assistant encountered an error. Please try again later.';
-        if (isset($data['error']['code']) && $data['error']['code'] === 'rate_limit_exceeded') {
-            $error_message = 'Rate limit exceeded. Please wait a moment and try again.';
-        }
-        error_log('ChatGPT API Response Error: ' . $data['error']['message']);
-        wp_send_json_error($error_message);
-        wp_die();
-    }
-
     if (isset($data['choices'][0]['message']['content'])) {
         $assistant_response = $data['choices'][0]['message']['content'];
-
-        // Use the Moderation API to check the assistant's response
-        // (Moderation code here, if implemented)
 
         // Append the assistant's response to the conversation history
         $chatgpt_history[] = array('role' => 'assistant', 'content' => $assistant_response);
 
-        // Save the updated conversation history again
-        set_transient($transient_key, $chatgpt_history, 24 * HOUR_IN_SECONDS);
-
-        // Prepare the conversation data
-        $plain_messages = array_map(function ($message) {
-            return sanitize_textarea_field($message['content']);
-        }, $chatgpt_history);
-        $conversation_data = wp_json_encode($plain_messages);
-
-        // Get the user ID, or use 0 for guest users
+        // Get the user ID
         $user_id = get_current_user_id() ?: 0;
 
-        // Update the existing conversation or create a new one
-        if ($existing_entry) {
-            $updated = $wpdb->update(
+        // Prepare the conversation data
+        $conversation_data = wp_json_encode($chatgpt_history);
+
+        // IMPORTANT: Use proper database operations with error checking
+        if ($existing_conversation) {
+            // Update existing conversation
+            $update_result = $wpdb->update(
                 $table_name,
                 array(
                     'conversation' => $conversation_data,
-                    'user_id' => $user_id,
+                    'user_id' => $user_id
                 ),
                 array('session_id' => $session_id),
                 array('%s', '%d'),
                 array('%s')
             );
 
-            if ($updated === false) {
-                error_log('Database update failed: ' . $wpdb->last_error);
-                wp_send_json_error('Failed to update conversation in the database.');
+            if ($update_result === false) {
+                error_log('Failed to update conversation: ' . $wpdb->last_error);
+                wp_send_json_error('Failed to update conversation.');
                 wp_die();
             }
         } else {
-            $inserted = $wpdb->insert(
+            // Insert new conversation
+            $insert_result = $wpdb->insert(
                 $table_name,
                 array(
                     'session_id' => $session_id,
                     'user_id' => $user_id,
-                    'conversation' => $conversation_data,
+                    'conversation' => $conversation_data
                 ),
                 array('%s', '%d', '%s')
             );
 
-            if ($inserted === false) {
-                error_log('Database insert failed: ' . $wpdb->last_error);
-                wp_send_json_error('Failed to save conversation in the database.');
+            if ($insert_result === false) {
+                error_log('Failed to insert conversation: ' . $wpdb->last_error);
+                wp_send_json_error('Failed to save conversation.');
                 wp_die();
             }
         }
 
-        // Send the assistant's response to the user
         wp_send_json_success($assistant_response);
     } else {
         wp_send_json_error('No response from assistant.');
@@ -262,8 +213,37 @@ function chatgpt_api_request() {
     }
 }
 
-add_action('wp_ajax_chatgpt_api_request', 'chatgpt_api_request'); // For logged-in users
-add_action('wp_ajax_nopriv_chatgpt_api_request', 'chatgpt_api_request'); // For guests
+// Helper function to initialize chat history
+function initialize_chat_history() {
+    $days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+    $currentDate = new DateTime();
+    $currentDay = $days[$currentDate->format('w')];
+    $tomorrowDate = (clone $currentDate)->modify('+1 day');
+    $tomorrowDay = $days[$tomorrowDate->format('w')];
+    $yesterdayDate = (clone $currentDate)->modify('-1 day');
+    $yesterdayDay = $days[$yesterdayDate->format('w')];
+    $currentDateNum = $currentDate->format('j');
+    $currentMonth = $currentDate->format('F');
+
+    return array(
+        array(
+            'role' => 'system',
+            'content' => "Today is $currentDay, the $currentDateNum of $currentMonth. Yesterday was $yesterdayDay, and tomorrow will be $tomorrowDay. You are a chatbot that will be placed on the Third Wave BBQ website to answer any customer's questions. Answer the question like a good customer service agent might. Be friendly and personable when answering. Ensure you consider things like the day and future days when answering questions. Elaborate on answers when you feel more information would be helpful."
+        )
+    );
+}
+
+// Add this debug function right before your action hooks
+function chatgpt_debug_log() {
+    error_log('Session ID: ' . (isset($_COOKIE['chatgpt_session_id']) ? $_COOKIE['chatgpt_session_id'] : 'not set'));
+}
+
+// Modify your existing action hooks to include the debug function
+add_action('wp_ajax_chatgpt_api_request', 'chatgpt_debug_log', 9); // Run before main function
+add_action('wp_ajax_chatgpt_api_request', 'chatgpt_api_request', 10); // Main function
+
+add_action('wp_ajax_nopriv_chatgpt_api_request', 'chatgpt_debug_log', 9); // Run before main function
+add_action('wp_ajax_nopriv_chatgpt_api_request', 'chatgpt_api_request', 10); // Main function
 
 // Shortcode to display the chatbot form
 function chatgpt_display_form() {
